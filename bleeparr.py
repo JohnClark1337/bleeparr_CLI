@@ -4,6 +4,8 @@
 # Imports
 # -----------------------------------------
 
+from __future__ import annotations
+
 import argparse
 import os
 import subprocess
@@ -68,6 +70,16 @@ parser.add_argument(
 parser.add_argument("--pre-buffer", type=int, default=100, help="Pre-buffer mute milliseconds (default 100)")
 parser.add_argument("--post-buffer", type=int, default=100, help="Post-buffer mute milliseconds (default 100)")
 parser.add_argument("--output-suffix", default="(edited by Bleeparr)", help="Suffix to append to output filename")
+parser.add_argument(
+    "--add-audio-track",
+    action="store_true",
+    help="Add the censored audio as a new track inside the original file (original audio and all other streams are preserved, file is edited in place)"
+)
+parser.add_argument(
+    "--audio-langs",
+    default="eng,en,english,und",
+    help="Comma-separated language tags to censor when --add-audio-track is used (default: eng,en,english,und - 'und' covers untagged tracks)"
+)
 parser.add_argument("--delete-original", action="store_true", help="Delete original video after successful censoring")
 parser.add_argument("--no-keep-subs", action="store_true", help="Delete subtitle file after processing")
 parser.add_argument("--swears", default="swears.txt", help="File containing swear words to censor")
@@ -120,7 +132,12 @@ DO_FULL_SUB_MUTE= DO_FSM
 PRE_BUFFER_MS = args.pre_buffer
 POST_BUFFER_MS = args.post_buffer
 OUTPUT_SUFFIX = args.output_suffix
+ADD_AUDIO_TRACK = args.add_audio_track
+CENSOR_TRACK_TITLE = "Censored (Bleeparr)"
 DELETE_ORIGINAL = args.delete_original
+if ADD_AUDIO_TRACK and DELETE_ORIGINAL:
+    print("⚠️ --delete-original is ignored when --add-audio-track is used.")
+    DELETE_ORIGINAL = False
 KEEP_SUBS = not args.no_keep_subs
 SWEARS_FILE = args.swears
 ALERT_CENSORING_OFF = args.alert_censoring_off
@@ -544,8 +561,220 @@ def merge_whisper_and_subtitles(whisper_bad_words, subtitle_bad_sections, fallba
     mute_segments.sort(key=lambda x: x["start"])
     return mute_segments, fallback_clips
 
-def build_and_run_ffmpeg(input_file, mute_points, pre_buffer_ms, post_buffer_ms, output_suffix):
+_CONTAINER_FMT = {
+    "matroska": "matroska",
+    "webm": "matroska",
+    "mov": "mp4",
+    "mp4": "mp4",
+    "m4a": "mp4",
+    "3gp": "mp4",
+}
+
+_KNOWN_STREAM_TYPES = {"video", "audio", "subtitle", "data", "attachment"}
+
+
+def _is_generated_track(stream):
+    """True for a Bleeparr audio track left behind by an earlier run."""
+    return stream["type"] == "audio" and stream["title"].startswith(CENSOR_TRACK_TITLE)
+
+
+def _probe_media(video_file):
+    probe = _run_cmd([
+        "ffprobe", "-v", "error",
+        "-print_format", "json",
+        "-show_streams",
+        "-show_format",
+        video_file,
+    ])
+    if probe.returncode != 0:
+        return {"format": "matroska", "streams": []}
+    try:
+        data = json.loads(probe.stdout or "{}")
+    except json.JSONDecodeError:
+        data = {}
+
+    fmt = (data.get("format", {}).get("format_name") or "matroska").split(",")[0].strip().lower()
+
+    streams = []
+    per_type = {}
+    for s in data.get("streams", []):
+        index = s.get("index")
+        codec_type = s.get("codec_type") or "unknown"
+        if index is None or codec_type not in _KNOWN_STREAM_TYPES:
+            continue
+        tags = s.get("tags") or {}
+        channels = s.get("channels") or 0
+        type_index = per_type.get(codec_type, 0)
+        per_type[codec_type] = type_index + 1
+        streams.append({
+            "index": index,
+            "type": codec_type,
+            "type_index": type_index,
+            "lang": (tags.get("language") or "und").lower(),
+            "title": tags.get("title") or "",
+            "channels": channels,
+            "layout": s.get("channel_layout") or f"{channels}ch",
+        })
+    return {"format": fmt, "streams": streams}
+
+
+def _select_audio_targets(audio_streams, langs):
+    """Return every audio stream we should censor, in stream order."""
+    wanted = {l.strip().lower() for l in langs.split(",") if l.strip()}
+    matched = [s for s in audio_streams if s["lang"] in wanted]
+    if not matched:
+        print(f"⚠️ No audio track matched {sorted(wanted)}; falling back to the first audio track.")
+        matched = audio_streams[:1]
+    return matched
+
+
+def _build_censored_filtergraph(mute_points, pre_buffer_ms, post_buffer_ms, beep,
+                                src_label, out_label):
+    """Build a filtergraph producing one censored audio stream. Returns (parts, output_label)."""
+    base = f"{out_label}_base"
+    parts = [f"[{src_label}]anull[{base}]"]
+    current = base
+
+    for i, m in enumerate(mute_points):
+        start = max(0, m["start"] - (pre_buffer_ms / 1000.0))
+        end = m["end"] + (post_buffer_ms / 1000.0)
+        nxt = f"{out_label}_m{i}"
+        parts.append(
+            f"[{current}]volume=enable='between(t,{start},{end})':volume=0[{nxt}]"
+        )
+        current = nxt
+
+    if not beep:
+        return parts, f"[{current}]"
+
+    beep_labels = []
+    for i, m in enumerate(mute_points):
+        start = max(0, m["start"] - (pre_buffer_ms / 1000.0))
+        end = m["end"] + (post_buffer_ms / 1000.0)
+        duration = round(max(0.001, end - start), 3)
+        delay_ms = int(start * 1000)
+        parts.append(f"aevalsrc=sin(2*PI*1000*t):d={duration}:s=44100[{out_label}_beep{i}]")
+        parts.append(f"[{out_label}_beep{i}]adelay={delay_ms}|{delay_ms}[{out_label}_dbeep{i}]")
+        beep_labels.append(f"[{out_label}_dbeep{i}]")
+
+    all_inputs = f"[{current}]" + "".join(beep_labels)
+    parts.append(
+        f"{all_inputs}amix=inputs={len(beep_labels) + 1}:duration=longest[{out_label}]"
+    )
+    return parts, f"[{out_label}]"
+
+
+def add_censored_audio_track(input_file, mute_points, pre_buffer_ms, post_buffer_ms,
+                             subtitle_lang="eng", beep=False, track_title=None,
+                             audio_langs="eng,en,english,und"):
+    """
+    Append a censored audio track for every matching audio stream, in place.
+    All original streams are stream-copied; only the new tracks are encoded.
+    Bleeparr tracks from an earlier run are dropped, so re-running rescans the
+    pristine originals and leaves exactly one set of censored tracks.
+    The result is written to a temp file in the same directory, then swapped in.
+    """
+    if not mute_points:
+        print("⚠️ No segments to censor; leaving the file untouched.")
+        return None
+
+    media = _probe_media(input_file)
+    streams = media["streams"]
+
+    generated = [s for s in streams if _is_generated_track(s)]
+    keep = [s for s in streams if not _is_generated_track(s)]
+    audio_streams = [s for s in keep if s["type"] == "audio"]
+
+    if not audio_streams:
+        print("❌ No audio streams found; cannot build a censored track.")
+        return None
+
+    container = _CONTAINER_FMT.get(media["format"], "matroska")
+
+    if generated:
+        print(f"♻️  Replacing {len(generated)} Bleeparr track(s) from a previous run: "
+              + ", ".join(s["title"] or "(untitled)" for s in generated))
+
+    targets = _select_audio_targets(audio_streams, audio_langs)
+    n_audio = len(audio_streams)
+    track_title = track_title or CENSOR_TRACK_TITLE
+    multi = len(targets) > 1
+
+    print(f"🎚️ {n_audio} audio track(s) kept; censoring "
+          f"{len(targets)}: " + ", ".join(f"{s['layout']}/{s['lang']}" for s in targets))
+
+    parts = []
+    labels = []
+    for j, stream in enumerate(targets):
+        sub_parts, label = _build_censored_filtergraph(
+            mute_points, pre_buffer_ms, post_buffer_ms, beep,
+            f"0:a:{stream['type_index']}", f"cens{j}",
+        )
+        parts.extend(sub_parts)
+        labels.append(label)
+    filter_complex = ";".join(parts)
+
+    tmp_out = os.path.join(
+        os.path.dirname(os.path.abspath(input_file)),
+        f".{os.path.basename(input_file)}.bleeparr-tmp",
+    )
+
+    cmd = f'ffmpeg -hide_banner -loglevel error -y -i "{input_file}" '
+    cmd += f'-filter_complex "{filter_complex}" '
+    for s in keep:
+        cmd += f'-map 0:{s["index"]} '
+    cmd += '-c:v copy -c:s copy -c:d copy -c:t copy '
+    for i in range(n_audio):
+        cmd += f'-c:a:{i} copy -disposition:a:{i} 0 '
+    for j, stream in enumerate(targets):
+        idx = n_audio + j
+        title = track_title if not multi else f"{track_title} ({stream['layout']})"
+        bitrate = 384 if stream["channels"] >= 6 else 192
+        cmd += f'-map "{labels[j]}" -c:a:{idx} aac -b:a:{idx} {bitrate}k '
+        cmd += f'-metadata:s:a:{idx} title="{title}" '
+        cmd += f'-metadata:s:a:{idx} language="{stream["lang"]}" '
+        cmd += f'-disposition:a:{idx} {"default" if j == 0 else "0"} '
+    cmd += f'-f {container} "{tmp_out}"'
+
+    print(f"🔧 Adding censored audio track(s) to: {input_file}")
+    result = subprocess.run(
+        cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+    )
+
+    if result.returncode != 0:
+        try:
+            os.remove(tmp_out)
+        except OSError:
+            pass
+        err = (result.stderr or "").lower()
+        if "no space left on device" in err:
+            print("❌ FFmpeg failed: No space left on device while writing output.")
+            print("👉 Free space on the drive holding this file (the copy needs ~1x the movie size).")
+        else:
+            print("❌ FFmpeg failed. Last lines from stderr:")
+            print("\n".join(result.stderr.strip().splitlines()[-20:]))
+        exit(1)
+
+    os.replace(tmp_out, input_file)
+    print(f"✅ Added {len(targets)} censored track(s) covering {len(mute_points)} segment(s). "
+          f"Original audio and all other streams preserved.")
+    return input_file
+
+
+def build_and_run_ffmpeg(input_file, mute_points, pre_buffer_ms, post_buffer_ms, output_suffix,
+                         add_audio_track=False, subtitle_lang="eng", audio_langs="eng,en,english,und"):
     """Build and execute ffmpeg command to mute or beep bad sections."""
+    if add_audio_track:
+        return add_censored_audio_track(
+            input_file,
+            mute_points,
+            pre_buffer_ms,
+            post_buffer_ms,
+            subtitle_lang=subtitle_lang,
+            beep=bool(use_beep),
+            audio_langs=audio_langs,
+        )
+
     output_file = os.path.splitext(input_file)[0] + f" {output_suffix}.mkv"
 
     if use_beep:
@@ -753,7 +982,19 @@ if __name__ == "__main__":
     print(f"🎛️ Beep mode = {beep_mode}. Using {len(selected_mutes)} segment(s).")
     
     #this line to use selected_mutes:
-    output_file = build_and_run_ffmpeg(INPUT_VIDEO, selected_mutes, PRE_BUFFER_MS, POST_BUFFER_MS, OUTPUT_SUFFIX)
+    output_file = build_and_run_ffmpeg(
+        INPUT_VIDEO,
+        selected_mutes,
+        PRE_BUFFER_MS,
+        POST_BUFFER_MS,
+        OUTPUT_SUFFIX,
+        add_audio_track=ADD_AUDIO_TRACK,
+        subtitle_lang=args.subtitle_lang,
+        audio_langs=args.audio_langs,
+    )
+    if output_file is None:
+        print("🎉 Nothing to do. Exiting without changes.")
+        exit(0)
 
     if DELETE_ORIGINAL and 'output_file' in locals() and os.path.exists(output_file):
         if os.path.exists(INPUT_VIDEO):

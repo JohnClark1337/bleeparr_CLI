@@ -1,9 +1,27 @@
-one word per line. For example:
-darn
-poop
-shoot
-phooy
-...
-get a comprehensive profanity word list that is mostly compatible with bleeparr from this repo:
-https://github.com/mmguero/cleanvid/blob/main/src/cleanvid/swears.txt
-if using swares.txt from cleanvid, remove any cleanvid 'alternitive subtitle word options'. ie: change "damn | darn" to "damn"
+ass
+asshole
+bastard
+bitch
+bollocks
+bugger
+Christ
+crap
+cum
+damn
+dick
+douche
+fuck
+fucking
+fuckin
+bullshit
+jackass
+motherfucker
+piss
+prick
+pussy
+shit
+shitty
+slut
+twat
+wanker
+whore

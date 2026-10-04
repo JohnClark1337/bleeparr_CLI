@@ -12,3 +12,8 @@ logs/
 .gitconfig
 swears.txt
 swears.private.txt
+
+# Docker / local compose state
+.env
+cache/
+*.bleeparr-tmp

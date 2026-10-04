@@ -1,0 +1,21 @@
+services:
+  bleeparr:
+    build:
+      context: .
+      args:
+        UID: "${UID:-1000}"
+        GID: "${GID:-1000}"
+        PREFETCH_MODELS: "${PREFETCH_MODELS:-0}"
+    image: bleeparr:local
+    user: "${UID:-1000}:${GID:-1000}"
+    environment:
+      HF_HOME: /home/bleeparr/.cache/huggingface
+      OMP_NUM_THREADS: "${OMP_NUM_THREADS:-4}"
+    volumes:
+      - /mnt/p2:/media
+      - hf-cache:/home/bleeparr/.cache
+    working_dir: /app
+    command: ["--help"]
+
+volumes:
+  hf-cache:

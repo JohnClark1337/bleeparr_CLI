@@ -1,0 +1,11 @@
+.git
+.gitignore
+__pycache__/
+*.pyc
+bleeparr.zip
+cache/
+.env
+Dockerfile*
+docker-compose*.yml
+*.md
+!README.md

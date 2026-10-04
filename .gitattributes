@@ -1,0 +1,10 @@
+# Normalize text files to LF in the repo and in the working tree.
+# Critical for docker-entrypoint.sh: a CRLF shebang breaks the container entrypoint.
+* text=auto eol=lf
+
+# Never touch binaries.
+*.zip binary
+*.mkv binary
+*.mp4 binary
+*.srt binary
+*.wav binary
